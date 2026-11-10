@@ -808,6 +808,31 @@ def fill_cmd(cmd: str, file_path: Path, module_dir: Path) -> str:
 # État (reprise), sauvegardes et rapports
 # ---------------------------------------------------------------------------
 
+def retry_io(fn, *args, attempts: int = 20):
+    """Windows : antivirus/indexation verrouillent parfois un fichier une fraction de seconde."""
+    for i in range(attempts):
+        try:
+            return fn(*args)
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(0.25)
+
+
+def write_text_safely(path: Path, text: str) -> None:
+    """Écriture via fichier temporaire + remplacement, avec repli en écriture directe."""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        retry_io(tmp.write_text, text, "utf-8")
+        retry_io(os.replace, str(tmp), str(path))
+    except OSError:
+        retry_io(path.write_text, text, "utf-8")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def state_path(rule: str) -> Path:
     return STATE_DIR / (safe_name(rule) + ".json")
 
@@ -824,9 +849,10 @@ def load_state(rule: str) -> dict:
 
 def save_state(rule: str, state: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = state_path(rule).with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=1, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(state_path(rule))
+    try:
+        write_text_safely(state_path(rule), json.dumps(state, indent=1, ensure_ascii=False))
+    except OSError as e:
+        log(f"  ATTENTION : suivi non enregistré ({e}) ; le run continue.")
 
 
 class RunDir:
@@ -850,7 +876,7 @@ class RunDir:
         name = rel_path.replace("\\", "/").split("/")[-1]
         dest = self.path / "backup" / f"{len(self.manifest['files']) + 1:04d}_{name}"
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(original)
+        retry_io(dest.write_bytes, original)
         self.manifest["files"][rel_path] = {"abs": str(abs_path), "backup": str(dest),
                                             "written_sha": sha256(original), "issues": []}
         self.save_manifest()
@@ -862,9 +888,7 @@ class RunDir:
         self.save_manifest()
 
     def save_manifest(self) -> None:
-        tmp = self.path / "manifest.tmp"
-        tmp.write_text(json.dumps(self.manifest, indent=1, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(self.path / "manifest.json")
+        write_text_safely(self.path / "manifest.json", json.dumps(self.manifest, indent=1, ensure_ascii=False))
 
     def write_issue_log(self, issue_key: str, sections: dict) -> None:
         body = "\n\n".join(f"===== {k} =====\n{v}" for k, v in sections.items())
@@ -1179,7 +1203,7 @@ class IssueContext:
 
     def restore(self) -> None:
         if self.original is not None and not self.dry_run:
-            self.path.write_bytes(self.original)
+            retry_io(self.path.write_bytes, self.original)
             self.original = None
 
     def reject(self, reason: str, status: str = "REJECT"):
@@ -1284,7 +1308,7 @@ class IssueContext:
         self.step("écriture")
         self.run_dir.backup(self.rel_path, self.path, src.raw)
         self.original = src.raw
-        self.path.write_bytes(new_bytes)
+        retry_io(self.path.write_bytes, new_bytes)
         for label, cmd in (("compilation", self.cfg.build_cmd), ("tests", self.cfg.test_cmd)):
             if not cmd:
                 continue
@@ -1366,7 +1390,7 @@ def cmd_undo(run_name: str = "") -> int:
             log(f"  modifié depuis le run, NON restauré (à vérifier à la main) : {rel}")
             kept += 1
             continue
-        target.write_bytes(backup.read_bytes())
+        retry_io(target.write_bytes, backup.read_bytes())
         restored += 1
         for key in info.get("issues", []):
             state.pop(key, None)
