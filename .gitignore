@@ -1,0 +1,4 @@
+.env
+reports/
+state/
+__pycache__/
