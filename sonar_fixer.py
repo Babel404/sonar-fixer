@@ -846,7 +846,9 @@ class RunDir:
     def backup(self, rel_path: str, abs_path: Path, original: bytes) -> None:
         if rel_path in self.manifest["files"]:
             return
-        dest = self.path / "backup" / Path(*rel_path.replace("\\", "/").split("/"))
+        # nom court et plat : évite la limite Windows de 260 caractères par chemin
+        name = rel_path.replace("\\", "/").split("/")[-1]
+        dest = self.path / "backup" / f"{len(self.manifest['files']) + 1:04d}_{name}"
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(original)
         self.manifest["files"][rel_path] = {"abs": str(abs_path), "backup": str(dest),
@@ -1069,7 +1071,14 @@ def cmd_fix(cfg: Config, sonar: Sonar, llm: LLM, rule: str, max_issues: int,
             ctx = IssueContext(cfg, llm, rule, rule_name, rule_desc, issue, dry_run,
                                module_ok, hash_stats, run_dir, progress)
             progress.begin(f"{short_path(ctx.rel_path)}:{issue_range(issue)[0]}")
-            status, reason, diff = ctx.process()
+            try:
+                status, reason, diff = ctx.process()
+            except (KeyboardInterrupt, FixerError):
+                raise
+            except Exception as e:  # une issue qui plante ne doit jamais arrêter tout le run
+                import traceback
+                ctx.log_sections["Erreur inattendue"] = traceback.format_exc()
+                status, reason, diff = ctx.reject(f"erreur inattendue : {type(e).__name__}: {e}"[:200])
             ctx = None
             progress.end(status)
             log(f"  {status:<6} {short_path(rel_or(issue, cfg))}:{issue_range(issue)[0]}  {reason}")
