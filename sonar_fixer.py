@@ -314,7 +314,7 @@ def load_env_file(path: Path) -> None:
 
 class Config:
     REQUIRED = ["SONAR_URL", "SONAR_TOKEN", "SONAR_PROJECT_KEY",
-                "MISTRAL_URL", "MISTRAL_MODEL", "REPO_PATH", "BUILD_CMD"]
+                "MISTRAL_URL", "MISTRAL_MODEL", "REPO_PATH"]
 
     def __init__(self) -> None:
         env = os.environ
@@ -331,7 +331,9 @@ class Config:
         self.model = env["MISTRAL_MODEL"].strip()
         self.repo = Path(env["REPO_PATH"].strip()).expanduser().resolve()
         self.source_root = env.get("SOURCE_ROOT", "").strip().strip("/\\")
-        self.build_cmd = env["BUILD_CMD"].strip()
+        self.build_cmd = env.get("BUILD_CMD", "").strip()
+        if self.build_cmd.lower() in ("none", "aucun", "aucune", "non", "-"):
+            self.build_cmd = ""  # pas de compilation : l'utilisateur compile lui-même
         self.test_cmd = env.get("TEST_CMD", "").strip()
         self.ca_bundle = env.get("CA_BUNDLE", "").strip()
         self.encoding = env.get("SOURCE_ENCODING", "").strip()
@@ -953,6 +955,12 @@ def cmd_check(cfg: Config, sonar: Sonar, llm: LLM) -> int:
             log(f"    ({len(problems)} fichier(s) seront ignorés)")
 
     log("5/5 Compilation (sans aucune modification, peut être long)")
+    if not cfg.build_cmd:
+        log("    IGNORÉE - BUILD_CMD vide : les corrections ne seront pas compilées par le script.")
+        log("              Compile toi-même et relis le diff avant de commiter.")
+        log("\nTout est prêt. Étape suivante : python sonar_fixer.py stats" if ok
+            else "\nCorrige les points en ÉCHEC dans .env, puis relance : python sonar_fixer.py check")
+        return 0 if ok else 1
     sample = java_files[0] if java_files else cfg.repo
     module_dir = find_module_dir(sample, cfg.repo) if java_files else cfg.repo
     cmd = fill_cmd(cfg.build_cmd, sample, module_dir)
@@ -1038,8 +1046,12 @@ def cmd_fix(cfg: Config, sonar: Sonar, llm: LLM, rule: str, max_issues: int,
     else:
         log("Les fichiers sont modifiés directement (aucune opération git).")
         log(f"Originaux sauvegardés dans : {run_dir.path / 'backup'}")
-    log("Pour chaque issue : Mistral propose -> contrôles -> écriture -> compilation"
-        " -> gardé si OK, sinon fichier restauré.")
+    if cfg.build_cmd:
+        log("Pour chaque issue : Mistral propose -> contrôles -> écriture -> compilation"
+            " -> gardé si OK, sinon fichier restauré.")
+    else:
+        log("Pour chaque issue : Mistral propose -> contrôles -> écriture.")
+        log("PAS DE COMPILATION (BUILD_CMD vide) : compile toi-même et relis le diff avant de commiter.")
     log("Ctrl+C pour arrêter proprement à tout moment (le fichier en cours est restauré).\n")
 
     progress = RunProgress(len(todo))
@@ -1096,6 +1108,8 @@ def cmd_fix(cfg: Config, sonar: Sonar, llm: LLM, rule: str, max_issues: int,
         log(f"Fichiers modifiés       : {changed}")
         if changed:
             log(f"Modifications à relire  : {run_dir.path / 'modifications.diff'}")
+            if not cfg.build_cmd:
+                log("À FAIRE                 : compiler le projet avant de commiter (non compilé par le script)")
             log("Pour tout annuler       : python sonar_fixer.py undo")
     log(f"Rapport (Excel)         : {run_dir.path / 'rapport.csv'}")
     if c["SKIP"] or c["REJECT"]:
@@ -1111,6 +1125,31 @@ def rel_or(issue: dict, cfg: Config) -> str:
     return comp.split(":", 1)[1] if ":" in comp else comp
 
 
+def resolve_source(cfg: Config, rel_path: str) -> Path:
+    """Chemin local du fichier. Si REPO_PATH n'est pas exactement la racine analysée par Sonar
+    (sous-dossier ou dossier parent), la bonne racine est retrouvée automatiquement."""
+    parts = [x for x in rel_path.replace("\\", "/").split("/") if x]
+    base = cfg.repo / cfg.source_root if cfg.source_root else cfg.repo
+    detected = getattr(cfg, "detected_base", None)
+    if detected is not None and detected.joinpath(*parts).is_file():
+        return detected.joinpath(*parts)
+    if base.joinpath(*parts).is_file():
+        return base.joinpath(*parts)
+    candidates = list(base.parents)
+    try:
+        candidates += [d for d in base.iterdir() if d.is_dir() and not d.name.startswith(".")]
+    except OSError:
+        pass
+    for root in candidates:
+        if root.joinpath(*parts).is_file():
+            if detected != root:
+                cfg.detected_base = root
+                log(f"  INFO : fichiers trouvés à partir de {root} (REPO_PATH = {cfg.repo}).")
+                log(f"         Pour aller plus vite, mets REPO_PATH={root} dans .env.")
+            return root.joinpath(*parts)
+    return base.joinpath(*parts)
+
+
 class IssueContext:
     """Traitement d'une issue : tout ce qui peut mal tourner aboutit à SKIP ou REJECT."""
 
@@ -1122,8 +1161,7 @@ class IssueContext:
         self.module_ok, self.hash_stats = module_ok, hash_stats
         self.run_dir, self.progress = run_dir, progress
         self.rel_path = rel_or(issue, cfg)
-        base = cfg.repo / cfg.source_root if cfg.source_root else cfg.repo
-        self.path = (base / self.rel_path).resolve()
+        self.path = resolve_source(cfg, self.rel_path)
         self.original = None
         self.log_sections: dict = {}
 
@@ -1249,7 +1287,8 @@ class IssueContext:
                 return self.reject(f"{label} : {why} après modification, fichier restauré")
         self.original = None
         self.run_dir.record_write(self.rel_path, new_bytes, self.issue["key"])
-        return "OK", f"lignes {p.start}-{p.end} -> {len(new_lines)} ligne(s), compile", diff
+        done = "compile" if self.cfg.build_cmd else "non compilé"
+        return "OK", f"lignes {p.start}-{p.end} -> {len(new_lines)} ligne(s), {done}", diff
 
     def check_hash(self, src: SourceFile, start: int):
         """0 si la ligne correspond, décalage si retrouvée à proximité, None si introuvable."""
@@ -1274,6 +1313,8 @@ class IssueContext:
         return None
 
     def ensure_baseline(self, module_dir: Path):
+        if not self.cfg.build_cmd:
+            return None
         key = str(module_dir)
         if key not in self.module_ok:
             if "{file}" in self.cfg.build_cmd:

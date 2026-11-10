@@ -49,6 +49,11 @@ L'encodage de chaque fichier est détecté (UTF-8, UTF-8 avec BOM, ANSI/Windows-
 conservé à l'octet près, fins de ligne comprises. Une proposition qui perd, modifie ou ajoute un
 accent ou un caractère spécial est rejetée. `check` affiche les encodages trouvés dans le repo.
 
+## Sans compilation
+`BUILD_CMD` vide dans `.env` : le script applique les corrections sans compiler. Tous les autres
+contrôles restent actifs, mais une correction qui casse la compilation peut passer : compile
+toi-même et relis `modifications.diff` (ou `git diff`) avant de commiter.
+
 ## Conseils
 - Commencer par des règles simples et fréquentes, `--max 20`, relire, puis augmenter.
 - Une règle avec beaucoup de REJECT : passer à la suivante (`--retry` pour retenter plus tard).
